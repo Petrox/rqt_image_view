@@ -50,6 +50,11 @@ ImageView::ImageView()
   , widget_(0)
   , num_gridlines_(0)
   , rotate_state_(ROTATE_0)
+  , hud_trigger_delay_(0.2)
+  , hud_stale_threshold_(0.5)
+  , hud_disappear_threshold_(3.0)
+  , main_dim_start_(1.0)
+  , main_dim_end_(10.0)
 {
   setObjectName("ImageView");
 }
@@ -64,6 +69,14 @@ void ImageView::initPlugin(qt_gui_cpp::PluginContext& context)
     widget_->setWindowTitle(widget_->windowTitle() + " (" + QString::number(context.serialNumber()) + ")");
   }
   context.addWidget(widget_);
+
+  // Load HUD overlay parameters
+  ros::NodeHandle pnh = getPrivateNodeHandle();
+  pnh.param("hud_trigger_delay", hud_trigger_delay_, 0.2);
+  pnh.param("hud_stale_threshold", hud_stale_threshold_, 0.5);
+  pnh.param("hud_disappear_threshold", hud_disappear_threshold_, 3.0);
+  pnh.param("main_dim_start", main_dim_start_, 1.0);
+  pnh.param("main_dim_end", main_dim_end_, 10.0);
 
   setColorSchemeList();
   ui_.color_scheme_combo_box->setCurrentIndex(ui_.color_scheme_combo_box->findText("Gray"));
@@ -326,8 +339,16 @@ void ImageView::selectTopic(const QString& topic)
 void ImageView::onTopicChanged(int index)
 {
   conversion_mat_.release();
+  hud_conversion_mat_.release();
 
   subscriber_.shutdown();
+  hud_subscriber_.shutdown();
+
+  // Reset timestamps
+  main_image_timestamp_ = ros::Time(0);
+  hud_image_timestamp_ = ros::Time(0);
+  last_main_update_time_ = ros::Time(0);
+  last_hud_update_time_ = ros::Time(0);
 
   // reset image on topic change
   ui_.image_frame->setImage(QImage());
@@ -343,6 +364,20 @@ void ImageView::onTopicChanged(int index)
     try {
       subscriber_ = it.subscribe(topic.toStdString(), 1, &ImageView::callbackImage, this, hints);
       //qDebug("ImageView::onTopicChanged() to topic '%s' with transport '%s'", topic.toStdString().c_str(), subscriber_.getTransport().c_str());
+
+      // Subscribe to HUD topic (base topic name + "_hud")
+      std::string base_topic = parseBaseTopicName(topic.toStdString(), transport.toStdString());
+      std::string hud_topic = base_topic + "_hud";
+
+      // Try to subscribe to HUD topic (it's okay if it doesn't exist)
+      try {
+        image_transport::TransportHints hud_hints("raw"); // HUD always uses raw transport
+        hud_subscriber_ = it.subscribe(hud_topic, 1, &ImageView::callbackImageHud, this, hud_hints);
+        //qDebug("ImageView::onTopicChanged() subscribed to HUD topic '%s'", hud_topic.c_str());
+      } catch (image_transport::TransportLoadException& e) {
+        // HUD topic doesn't exist or failed to load, which is fine
+        //qDebug("ImageView::onTopicChanged() HUD topic '%s' not available: %s", hud_topic.c_str(), e.what());
+      }
     } catch (image_transport::TransportLoadException& e) {
       QMessageBox::warning(widget_, tr("Loading image transport plugin failed"), e.what());
     }
@@ -626,7 +661,7 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
     }
   }
 
-  // Handle rotation
+  // Handle rotation (only for main image, not HUD)
   switch(rotate_state_)
   {
     case ROTATE_90:
@@ -654,17 +689,234 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
       break;
   }
 
-  // image must be copied since it uses the conversion_mat_ for storage which is asynchronously overwritten in the next callback invocation
-  QImage image(conversion_mat_.data, conversion_mat_.cols, conversion_mat_.rows, conversion_mat_.step[0], QImage::Format_RGB888);
+  // Store timestamp and update time for main image
+  main_image_timestamp_ = msg->header.stamp;
+  last_main_update_time_ = ros::Time::now();
+
+  // Generate composite image with HUD overlay
+  generateCompositeImage();
+}
+
+std::string ImageView::parseBaseTopicName(const std::string& topic, const std::string& transport)
+{
+  // Strip transport suffix (e.g., "/compressed", "/theora") from the topic name
+  // Example: "/camera/image_raw" + "compressed" -> "/camera/image_raw"
+  // We need to handle cases where the transport is appended as a suffix
+
+  std::string base_topic = topic;
+
+  // Check if the topic ends with the transport name
+  if (!transport.empty() && transport != "raw")
+  {
+    std::string transport_suffix = "/" + transport;
+    size_t pos = base_topic.rfind(transport_suffix);
+    if (pos != std::string::npos && pos == base_topic.length() - transport_suffix.length())
+    {
+      base_topic = base_topic.substr(0, pos);
+    }
+  }
+
+  return base_topic;
+}
+
+void ImageView::applyDimmingOverlay(cv::Mat& img, double delay_sec)
+{
+  if (delay_sec <= main_dim_start_)
+  {
+    return; // No dimming needed
+  }
+
+  // Calculate dimming factor: linear interpolation from 0% to 70% black
+  double factor = (delay_sec - main_dim_start_) / (main_dim_end_ - main_dim_start_);
+  factor = std::min(1.0, std::max(0.0, factor)); // Clamp to [0, 1]
+
+  double overlay_alpha = factor * 0.7; // 0% to 70% black overlay
+
+  // Apply darkening by multiplying pixel values
+  img = img * (1.0 - overlay_alpha);
+}
+
+cv::Mat ImageView::processStaleHud(const cv::Mat& hud, double age_sec)
+{
+  if (hud.empty())
+  {
+    return cv::Mat(); // Return empty if input is empty
+  }
+
+  // If HUD is too old, make it disappear
+  if (age_sec > hud_disappear_threshold_)
+  {
+    return cv::Mat(); // Return empty mat to skip HUD rendering
+  }
+
+  cv::Mat processed_hud = hud.clone();
+
+  // If HUD is stale but not too old, apply grayscale and transparency effects
+  if (age_sec > hud_stale_threshold_)
+  {
+    // Convert to grayscale
+    cv::Mat gray;
+    cv::cvtColor(processed_hud, gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(gray, processed_hud, cv::COLOR_GRAY2BGR);
+
+    // Apply 50% transparency effect (will be used during blending)
+    processed_hud = processed_hud * 0.5;
+
+    // Add "stale hud data" text in red at bottom right
+    std::string text = "stale hud data";
+    int font_face = cv::FONT_HERSHEY_SIMPLEX;
+    double font_scale = 0.7;
+    int thickness = 2;
+    int baseline = 0;
+
+    cv::Size text_size = cv::getTextSize(text, font_face, font_scale, thickness, &baseline);
+
+    // Position at bottom right corner with some padding
+    cv::Point text_pos(processed_hud.cols - text_size.width - 10,
+                       processed_hud.rows - 10);
+
+    // Draw text in red (BGR: 0, 0, 255)
+    cv::putText(processed_hud, text, text_pos, font_face, font_scale,
+                cv::Scalar(0, 0, 255), thickness);
+  }
+
+  return processed_hud;
+}
+
+void ImageView::overlayHud(cv::Mat& main, const cv::Mat& hud)
+{
+  if (hud.empty() || main.empty())
+  {
+    return; // Nothing to overlay
+  }
+
+  // Scale HUD to match main image dimensions independently
+  cv::Mat hud_scaled;
+  if (hud.size() != main.size())
+  {
+    cv::resize(hud, hud_scaled, main.size(), 0, 0, cv::INTER_LINEAR);
+  }
+  else
+  {
+    hud_scaled = hud;
+  }
+
+  // Ensure both images have the same type
+  if (hud_scaled.type() != main.type())
+  {
+    hud_scaled.convertTo(hud_scaled, main.type());
+  }
+
+  // Alpha blend HUD over main image
+  // Using addWeighted for simple transparency blending
+  // Alpha value for HUD overlay (0.7 means 70% HUD, 30% main shows through)
+  double hud_alpha = 0.7;
+  cv::addWeighted(main, 1.0, hud_scaled, hud_alpha, 0, main);
+}
+
+void ImageView::generateCompositeImage()
+{
+  cv::Mat composite;
+  ros::Time now = ros::Time::now();
+
+  // Handle case where we have HUD but no main image
+  if (conversion_mat_.empty())
+  {
+    // If we have HUD data, create a black background to display it on
+    if (!hud_conversion_mat_.empty() && !hud_image_timestamp_.isZero())
+    {
+      double hud_age = (now - hud_image_timestamp_).toSec();
+      cv::Mat processed_hud = processStaleHud(hud_conversion_mat_, hud_age);
+
+      if (!processed_hud.empty())
+      {
+        // Create black background matching HUD size
+        composite = cv::Mat::zeros(hud_conversion_mat_.rows, hud_conversion_mat_.cols, CV_8UC3);
+        overlayHud(composite, processed_hud);
+
+        // Display the HUD-only image
+        QImage image(composite.data, composite.cols, composite.rows, composite.step[0], QImage::Format_RGB888);
+        ui_.image_frame->setImage(image);
+
+        if (!ui_.zoom_1_push_button->isEnabled())
+        {
+          ui_.zoom_1_push_button->setEnabled(true);
+        }
+        onZoom1(ui_.zoom_1_push_button->isChecked());
+      }
+    }
+    return; // Nothing to display
+  }
+
+  // Start with a copy of the processed main image
+  composite = conversion_mat_.clone();
+
+  // Calculate main image age and apply dimming
+  double main_age = 0.0;
+
+  if (!main_image_timestamp_.isZero())
+  {
+    main_age = (now - main_image_timestamp_).toSec();
+    applyDimmingOverlay(composite, main_age);
+  }
+
+  // Process and overlay HUD if available
+  if (!hud_conversion_mat_.empty() && !hud_image_timestamp_.isZero())
+  {
+    double hud_age = (now - hud_image_timestamp_).toSec();
+    cv::Mat processed_hud = processStaleHud(hud_conversion_mat_, hud_age);
+
+    if (!processed_hud.empty())
+    {
+      overlayHud(composite, processed_hud);
+    }
+  }
+
+  // Update the display with composite image
+  QImage image(composite.data, composite.cols, composite.rows, composite.step[0], QImage::Format_RGB888);
   ui_.image_frame->setImage(image);
 
   if (!ui_.zoom_1_push_button->isEnabled())
   {
     ui_.zoom_1_push_button->setEnabled(true);
   }
-  // Need to update the zoom 1 every new image in case the image aspect ratio changed,
-  // though could check and see if the aspect ratio changed or not.
   onZoom1(ui_.zoom_1_push_button->isChecked());
+}
+
+void ImageView::callbackImageHud(const sensor_msgs::Image::ConstPtr& msg)
+{
+  try
+  {
+    // Convert ROS image to OpenCV format
+    cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+
+    // Store HUD image and timestamp
+    hud_conversion_mat_ = cv_ptr->image.clone();
+    hud_image_timestamp_ = msg->header.stamp;
+    last_hud_update_time_ = ros::Time::now();
+
+    // Trigger redraw if:
+    // 1. No main image has been received yet (display HUD on black background), OR
+    // 2. Main image hasn't updated recently (beyond trigger delay)
+    if (last_main_update_time_.isZero())
+    {
+      // No main image yet - display HUD alone
+      generateCompositeImage();
+    }
+    else
+    {
+      // Main image exists - only trigger if it hasn't updated recently
+      double time_since_main = (ros::Time::now() - last_main_update_time_).toSec();
+      if (time_since_main > hud_trigger_delay_)
+      {
+        generateCompositeImage();
+      }
+    }
+  }
+  catch (cv_bridge::Exception& e)
+  {
+    ROS_ERROR("cv_bridge exception in HUD callback: %s", e.what());
+  }
 }
 }
 

@@ -117,11 +117,23 @@ protected:
 
   virtual void callbackImage(const sensor_msgs::Image::ConstPtr& msg);
 
+  virtual void callbackImageHud(const sensor_msgs::Image::ConstPtr& msg);
+
   virtual void invertPixels(int x, int y);
 
   QList<int> getGridIndices(int size) const;
 
   virtual void overlayGrid();
+
+  std::string parseBaseTopicName(const std::string& topic, const std::string& transport);
+
+  void applyDimmingOverlay(cv::Mat& img, double delay_sec);
+
+  cv::Mat processStaleHud(const cv::Mat& hud, double age_sec);
+
+  void overlayHud(cv::Mat& main, const cv::Mat& hud);
+
+  void generateCompositeImage();
 
   Ui::ImageViewWidget ui_;
 
@@ -129,7 +141,11 @@ protected:
 
   image_transport::Subscriber subscriber_;
 
+  image_transport::Subscriber hud_subscriber_;
+
   cv::Mat conversion_mat_;
+
+  cv::Mat hud_conversion_mat_;
 
 private:
 
@@ -154,6 +170,19 @@ private:
   int num_gridlines_;
 
   RotateState rotate_state_;
+
+  // HUD overlay state
+  ros::Time main_image_timestamp_;
+  ros::Time hud_image_timestamp_;
+  ros::Time last_main_update_time_;
+  ros::Time last_hud_update_time_;
+
+  // HUD configuration parameters
+  double hud_trigger_delay_;
+  double hud_stale_threshold_;
+  double hud_disappear_threshold_;
+  double main_dim_start_;
+  double main_dim_end_;
 };
 
 }
