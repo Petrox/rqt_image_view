@@ -877,7 +877,9 @@ void ImageView::overlayHud(cv::Mat& main, const cv::Mat& hud)
   // Ensure both images have the same type
   if (hud_scaled.type() != main.type())
   {
-    hud_scaled.convertTo(hud_scaled, main.type());
+    cv::Mat hud_converted;
+    hud_scaled.convertTo(hud_converted, main.type());
+    hud_scaled = hud_converted;
   }
 
   // Alpha blend HUD over main image
