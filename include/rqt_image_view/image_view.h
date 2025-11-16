@@ -181,9 +181,9 @@ private:
 
   QAction* hide_toolbar_action_;
 
-  int num_gridlines_;
+  std::atomic<int> num_gridlines_;
 
-  RotateState rotate_state_;
+  std::atomic<int> rotate_state_;
 
   // HUD overlay state
   ros::Time main_image_timestamp_;
