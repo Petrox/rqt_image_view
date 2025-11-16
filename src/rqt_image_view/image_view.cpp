@@ -750,9 +750,6 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
   main_image_timestamp_ = msg->header.stamp;
   last_main_update_time_ = ros::Time::now();
 
-  ROS_INFO_THROTTLE(1.0, "rqt_image_view: Main image callback - timestamp: %.3f (zero: %d), update time: %.3f",
-                    main_image_timestamp_.toSec(), main_image_timestamp_.isZero(), last_main_update_time_.toSec());
-
   // Generate composite image with HUD overlay
   generateCompositeImage();
 }
@@ -945,31 +942,23 @@ void ImageView::generateCompositeImage()
     {
       // Both timestamps valid - use message time difference
       hud_age = std::abs((main_image_timestamp_ - hud_image_timestamp_).toSec());
-      ROS_INFO_THROTTLE(1.0, "rqt_image_view: Composite generation - HUD available, age (from timestamps): %.3f sec", hud_age);
     }
     else
     {
       // Timestamps not available - fall back to wall clock time
       hud_age = (ros::Time::now() - last_hud_update_time_).toSec();
-      ROS_INFO_THROTTLE(1.0, "rqt_image_view: Composite generation - HUD available, age (from wall clock): %.3f sec", hud_age);
     }
 
     cv::Mat processed_hud = processStaleHud(hud_conversion_mat_, hud_age);
 
     if (!processed_hud.empty())
     {
-      ROS_INFO_THROTTLE(1.0, "rqt_image_view: Overlaying HUD onto main image");
       overlayHud(composite, processed_hud);
     }
     else
     {
-      ROS_INFO_THROTTLE(1.0, "rqt_image_view: HUD too old (%.3f sec), not displaying", hud_age);
       hud_filtered_out = true;
     }
-  }
-  else
-  {
-    ROS_INFO_THROTTLE(1.0, "rqt_image_view: No HUD data available");
   }
 
   // Draw "HUD info obsolete" message with timestamp when HUD is filtered out
@@ -1034,9 +1023,6 @@ void ImageView::callbackImageHud(const sensor_msgs::Image::ConstPtr& msg)
     hud_conversion_mat_ = cv_ptr->image.clone();
     hud_image_timestamp_ = msg->header.stamp;
     last_hud_update_time_ = ros::Time::now();
-
-    ROS_INFO_THROTTLE(1.0, "rqt_image_view: HUD callback received image %dx%d, timestamp %.3f",
-                      hud_conversion_mat_.cols, hud_conversion_mat_.rows, msg->header.stamp.toSec());
 
     // Trigger redraw if:
     // 1. No main image has been received yet (display HUD on black background), OR
