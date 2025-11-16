@@ -659,7 +659,8 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
   {
     // First let cv_bridge do its magic
     cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::RGB8);
-    conversion_mat_ = cv_ptr->image;
+    // Clone to create independent copy - keeps data valid after message buffer reuse
+    conversion_mat_ = cv_ptr->image.clone();
 
     if (num_gridlines_.load() > 0)
       overlayGrid();
@@ -672,8 +673,8 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
       cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg);
       if (msg->encoding == "CV_8UC3")
       {
-        // assuming it is rgb
-        conversion_mat_ = cv_ptr->image;
+        // assuming it is rgb - clone to keep data valid
+        conversion_mat_ = cv_ptr->image.clone();
       } else if (msg->encoding == "8UC1") {
         // convert gray to rgb
         cv::cvtColor(cv_ptr->image, conversion_mat_, CV_GRAY2RGB);
