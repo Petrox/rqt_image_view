@@ -49,6 +49,8 @@ namespace rqt_image_view {
 ImageView::ImageView()
   : rqt_gui_cpp::Plugin()
   , widget_(0)
+  , pub_topic_custom_(false)
+  , hide_toolbar_action_(0)
   , num_gridlines_(0)
   , rotate_state_(ROTATE_0)
   , hud_trigger_delay_(0.2)
@@ -165,7 +167,7 @@ void ImageView::saveSettings(qt_gui_cpp::Settings& plugin_settings, qt_gui_cpp::
   instance_settings.setValue("toolbar_hidden", hide_toolbar_action_->isChecked());
   instance_settings.setValue("num_gridlines", ui_.num_gridlines_spin_box->value());
   instance_settings.setValue("smooth_image", ui_.smooth_image_check_box->isChecked());
-  instance_settings.setValue("rotate", rotate_state_);
+  instance_settings.setValue("rotate", rotate_state_.load());
   instance_settings.setValue("color_scheme", ui_.color_scheme_combo_box->currentIndex());
 }
 
@@ -180,8 +182,9 @@ void ImageView::restoreSettings(const qt_gui_cpp::Settings& plugin_settings, con
   double max_range = instance_settings.value("max_range", ui_.max_range_double_spin_box->value()).toDouble();
   ui_.max_range_double_spin_box->setValue(max_range);
 
-  num_gridlines_ = instance_settings.value("num_gridlines", ui_.num_gridlines_spin_box->value()).toInt();
-  ui_.num_gridlines_spin_box->setValue(num_gridlines_);
+  int gridlines = instance_settings.value("num_gridlines", ui_.num_gridlines_spin_box->value()).toInt();
+  num_gridlines_.store(gridlines);
+  ui_.num_gridlines_spin_box->setValue(gridlines);
 
   QString topic = instance_settings.value("topic", "").toString();
   // don't overwrite topic name passed as command line argument
@@ -207,9 +210,10 @@ void ImageView::restoreSettings(const qt_gui_cpp::Settings& plugin_settings, con
   bool smooth_image_checked = instance_settings.value("smooth_image", false).toBool();
   ui_.smooth_image_check_box->setChecked(smooth_image_checked);
 
-  rotate_state_ = static_cast<RotateState>(instance_settings.value("rotate", 0).toInt());
-  if(rotate_state_ >= ROTATE_STATE_COUNT)
-    rotate_state_ = ROTATE_0;
+  int rotate = instance_settings.value("rotate", 0).toInt();
+  if(rotate >= ROTATE_STATE_COUNT)
+    rotate = ROTATE_0;
+  rotate_state_.store(rotate);
   syncRotateLabel();
 
   int color_scheme = instance_settings.value("color_scheme", ui_.color_scheme_combo_box->currentIndex()).toInt();
@@ -457,7 +461,7 @@ void ImageView::onColorSchemeChanged(int index)
 
 void ImageView::updateNumGridlines()
 {
-  num_gridlines_ = ui_.num_gridlines_spin_box->value();
+  num_gridlines_.store(ui_.num_gridlines_spin_box->value());
 }
 
 void ImageView::saveImage()
@@ -510,7 +514,7 @@ void ImageView::onMouseLeft(int x, int y)
 
     geometry_msgs::Point clickLocation = clickCanvasLocation;
 
-    switch(rotate_state_)
+    switch(rotate_state_.load())
     {
       case ROTATE_90:
         clickLocation.x = clickCanvasLocation.y;
@@ -545,23 +549,23 @@ void ImageView::onHideToolbarChanged(bool hide)
 
 void ImageView::onRotateLeft()
 {
-  int m = rotate_state_ - 1;
+  int m = rotate_state_.load() - 1;
   if(m < 0)
     m = ROTATE_STATE_COUNT-1;
 
-  rotate_state_ = static_cast<RotateState>(m);
+  rotate_state_.store(m);
   syncRotateLabel();
 }
 
 void ImageView::onRotateRight()
 {
-  rotate_state_ = static_cast<RotateState>((rotate_state_ + 1) % ROTATE_STATE_COUNT);
+  rotate_state_.store((rotate_state_.load() + 1) % ROTATE_STATE_COUNT);
   syncRotateLabel();
 }
 
 void ImageView::syncRotateLabel()
 {
-  switch(rotate_state_)
+  switch(rotate_state_.load())
   {
     default:
     case ROTATE_0:   ui_.rotate_label->setText("0°"); break;
@@ -585,12 +589,15 @@ QList<int> ImageView::getGridIndices(int size) const
 {
   QList<int> indices;
 
+  // Thread-safe: load atomic value once for consistency
+  const int gridlines = num_gridlines_.load();
+
   // the spacing between adjacent grid lines
-  float grid_width = 1.0f * size / (num_gridlines_ + 1);
+  float grid_width = 1.0f * size / (gridlines + 1);
 
   // select grid line(s) closest to the center
   float index;
-  if (num_gridlines_ % 2)  // odd
+  if (gridlines % 2)  // odd
   {
     indices.append(size / 2);
     // make the center line 2px wide in case of an even resolution
@@ -600,7 +607,7 @@ QList<int> ImageView::getGridIndices(int size) const
   }
   else  // even
   {
-    index = grid_width * (num_gridlines_ / 2);
+    index = grid_width * (gridlines / 2);
     // one grid line before the center
     indices.append(round(index));
     // one grid line after the center
@@ -608,7 +615,7 @@ QList<int> ImageView::getGridIndices(int size) const
   }
 
   // add additional grid lines from the center to the border of the image
-  int lines = (num_gridlines_ - 1) / 2;
+  int lines = (gridlines - 1) / 2;
   while (lines > 0)
   {
     index -= grid_width;
@@ -654,7 +661,7 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
     cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::RGB8);
     conversion_mat_ = cv_ptr->image;
 
-    if (num_gridlines_ > 0)
+    if (num_gridlines_.load() > 0)
       overlayGrid();
   }
   catch (cv_bridge::Exception& e)
@@ -711,7 +718,7 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
   }
 
   // Handle rotation (only for main image, not HUD)
-  switch(rotate_state_)
+  switch(rotate_state_.load())
   {
     case ROTATE_90:
     {
