@@ -1037,11 +1037,8 @@ void ImageView::callbackImageHud(const sensor_msgs::Image::ConstPtr& msg)
     {
       // Main image exists - trigger if it hasn't updated recently (use wall clock for trigger timing)
       double time_since_main = (ros::Time::now() - last_main_update_time_).toSec();
-      ROS_DEBUG_THROTTLE(1.0, "rqt_image_view: HUD received, time since main update: %.3f sec (trigger delay: %.3f)",
-                         time_since_main, hud_trigger_delay_);
       if (time_since_main > hud_trigger_delay_)
       {
-        ROS_DEBUG("rqt_image_view: Triggering composite generation from HUD callback (main image hasn't updated recently)");
         generateCompositeImage();
       }
     }
