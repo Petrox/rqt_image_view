@@ -871,7 +871,7 @@ void ImageView::overlayHud(cv::Mat& main, const cv::Mat& hud)
   }
   else
   {
-    hud_scaled = hud;
+    hud_scaled = hud.clone();  // Deep copy to prevent shared buffer issues
   }
 
   // Ensure both images have the same type
