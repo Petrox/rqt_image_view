@@ -1040,9 +1040,8 @@ void ImageView::callbackImageHud(const sensor_msgs::Image::ConstPtr& msg)
     // 2. Main image hasn't updated recently (beyond trigger delay)
     if (last_main_update_time_.isZero())
     {
-      // No main image yet - display HUD alone
-      // NOTE: This should only happen briefly when first selecting a topic before main callback runs
-      ROS_WARN("rqt_image_view: No main image callback yet (last_main_update_time is zero), displaying HUD alone");
+      // No main image yet - display HUD alone (happens when viewing HUD-only topic)
+      ROS_INFO_ONCE("rqt_image_view: Displaying HUD on black background (no main image topic selected)");
       generateCompositeImage();
     }
     else
