@@ -38,6 +38,7 @@
 
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/imgproc/imgproc.hpp>
+#include <ctime>
 
 #include <QFileDialog>
 #include <QMessageBox>
@@ -70,6 +71,9 @@ void ImageView::initPlugin(qt_gui_cpp::PluginContext& context)
   }
   context.addWidget(widget_);
 
+  // Version identifier for custom build
+  ROS_INFO("=== rqt_image_view CUSTOM BUILD with HUD overlay support (2024-11-15) ===");
+
   // Load HUD overlay parameters
   ros::NodeHandle pnh = getPrivateNodeHandle();
   pnh.param("hud_trigger_delay", hud_trigger_delay_, 0.2);
@@ -80,6 +84,18 @@ void ImageView::initPlugin(qt_gui_cpp::PluginContext& context)
 
   setColorSchemeList();
   ui_.color_scheme_combo_box->setCurrentIndex(ui_.color_scheme_combo_box->findText("Gray"));
+
+  // Initialize cached UI values for thread-safe access from ROS callbacks
+  max_range_ = ui_.max_range_double_spin_box->value();
+  dynamic_range_enabled_ = ui_.dynamic_range_check_box->isChecked();
+  color_scheme_ = ui_.color_scheme_combo_box->itemData(ui_.color_scheme_combo_box->currentIndex()).toInt();
+
+  // Connect slots to update cached values when UI changes
+  connect(ui_.max_range_double_spin_box, SIGNAL(valueChanged(double)), this, SLOT(onMaxRangeChanged(double)));
+  connect(ui_.color_scheme_combo_box, SIGNAL(currentIndexChanged(int)), this, SLOT(onColorSchemeChanged(int)));
+
+  // Connect signal/slot for thread-safe image updates from ROS callbacks
+  connect(this, SIGNAL(newImageAvailable(QImage)), this, SLOT(updateImageDisplay(QImage)), Qt::QueuedConnection);
 
   updateTopicList();
   ui_.topics_combo_box->setCurrentIndex(ui_.topics_combo_box->findText(""));
@@ -338,17 +354,22 @@ void ImageView::selectTopic(const QString& topic)
 
 void ImageView::onTopicChanged(int index)
 {
-  conversion_mat_.release();
-  hud_conversion_mat_.release();
-
   subscriber_.shutdown();
   hud_subscriber_.shutdown();
 
-  // Reset timestamps
-  main_image_timestamp_ = ros::Time(0);
-  hud_image_timestamp_ = ros::Time(0);
-  last_main_update_time_ = ros::Time(0);
-  last_hud_update_time_ = ros::Time(0);
+  {
+    // Lock mutex while resetting shared state
+    std::lock_guard<std::recursive_mutex> lock(image_mutex_);
+
+    conversion_mat_.release();
+    hud_conversion_mat_.release();
+
+    // Reset timestamps
+    main_image_timestamp_ = ros::Time(0);
+    hud_image_timestamp_ = ros::Time(0);
+    last_main_update_time_ = ros::Time(0);
+    last_hud_update_time_ = ros::Time(0);
+  }
 
   // reset image on topic change
   ui_.image_frame->setImage(QImage());
@@ -363,20 +384,22 @@ void ImageView::onTopicChanged(int index)
     image_transport::TransportHints hints(transport.toStdString());
     try {
       subscriber_ = it.subscribe(topic.toStdString(), 1, &ImageView::callbackImage, this, hints);
-      //qDebug("ImageView::onTopicChanged() to topic '%s' with transport '%s'", topic.toStdString().c_str(), subscriber_.getTransport().c_str());
+      ROS_INFO("rqt_image_view: Subscribed to main topic '%s' with transport '%s'", topic.toStdString().c_str(), subscriber_.getTransport().c_str());
 
       // Subscribe to HUD topic (base topic name + "_hud")
       std::string base_topic = parseBaseTopicName(topic.toStdString(), transport.toStdString());
       std::string hud_topic = base_topic + "_hud";
+      ROS_INFO("rqt_image_view: Parsed base topic from '%s' (transport '%s') -> base '%s', HUD topic '%s'",
+               topic.toStdString().c_str(), transport.toStdString().c_str(), base_topic.c_str(), hud_topic.c_str());
 
       // Try to subscribe to HUD topic (it's okay if it doesn't exist)
       try {
         image_transport::TransportHints hud_hints("raw"); // HUD always uses raw transport
         hud_subscriber_ = it.subscribe(hud_topic, 1, &ImageView::callbackImageHud, this, hud_hints);
-        //qDebug("ImageView::onTopicChanged() subscribed to HUD topic '%s'", hud_topic.c_str());
+        ROS_INFO("rqt_image_view: Successfully subscribed to HUD topic '%s'", hud_topic.c_str());
       } catch (image_transport::TransportLoadException& e) {
         // HUD topic doesn't exist or failed to load, which is fine
-        //qDebug("ImageView::onTopicChanged() HUD topic '%s' not available: %s", hud_topic.c_str(), e.what());
+        ROS_WARN("rqt_image_view: HUD topic '%s' not available: %s", hud_topic.c_str(), e.what());
       }
     } catch (image_transport::TransportLoadException& e) {
       QMessageBox::warning(widget_, tr("Loading image transport plugin failed"), e.what());
@@ -384,6 +407,19 @@ void ImageView::onTopicChanged(int index)
   }
 
   onMousePublish(ui_.publish_click_location_check_box->isChecked());
+}
+
+void ImageView::updateImageDisplay(const QImage& image)
+{
+  // This slot runs on Qt main thread - safe to update UI
+  // No mutex needed here as QImage is passed by value (deep copy)
+  ui_.image_frame->setImage(image);
+
+  if (!ui_.zoom_1_push_button->isEnabled())
+  {
+    ui_.zoom_1_push_button->setEnabled(true);
+  }
+  onZoom1(ui_.zoom_1_push_button->isChecked());
 }
 
 void ImageView::onZoom1(bool checked)
@@ -405,7 +441,18 @@ void ImageView::onZoom1(bool checked)
 
 void ImageView::onDynamicRange(bool checked)
 {
+  dynamic_range_enabled_ = checked;  // Update cached value
   ui_.max_range_double_spin_box->setEnabled(!checked);
+}
+
+void ImageView::onMaxRangeChanged(double value)
+{
+  max_range_ = value;  // Update cached value for thread-safe access
+}
+
+void ImageView::onColorSchemeChanged(int index)
+{
+  color_scheme_ = ui_.color_scheme_combo_box->itemData(index).toInt();  // Update cached value
 }
 
 void ImageView::updateNumGridlines()
@@ -598,6 +645,9 @@ void ImageView::overlayGrid()
 
 void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
 {
+  // Lock recursive_mutex to protect shared image data and timestamps from concurrent access
+  std::lock_guard<std::recursive_mutex> lock(image_mutex_);
+
   try
   {
     // First let cv_bridge do its magic
@@ -623,9 +673,9 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
       } else if (msg->encoding == "16UC1" || msg->encoding == "32FC1") {
         // scale / quantify
         double min = 0;
-        double max = ui_.max_range_double_spin_box->value();
+        double max = max_range_.load();  // Thread-safe: read cached value
         if (msg->encoding == "16UC1") max *= 1000;
-        if (ui_.dynamic_range_check_box->isChecked())
+        if (dynamic_range_enabled_.load())  // Thread-safe: read cached value
         {
           // dynamically adjust range based on min/max in image
           cv::minMaxLoc(cv_ptr->image, &min, &max);
@@ -638,8 +688,7 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
         cv::Mat img_scaled_8u;
         cv::Mat(cv_ptr->image-min).convertTo(img_scaled_8u, CV_8UC1, 255. / (max - min));
 
-        const auto color_scheme_index = ui_.color_scheme_combo_box->currentIndex();
-        const auto color_scheme = ui_.color_scheme_combo_box->itemData(color_scheme_index).toInt();
+        const auto color_scheme = color_scheme_.load();  // Thread-safe: read cached value
         if (color_scheme == -1) {
           cv::cvtColor(img_scaled_8u, conversion_mat_, CV_GRAY2RGB);
         } else {
@@ -649,14 +698,14 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
         }
       } else {
         qWarning("ImageView.callback_image() could not convert image from '%s' to 'rgb8' (%s)", msg->encoding.c_str(), e.what());
-        ui_.image_frame->setImage(QImage());
+        emit newImageAvailable(QImage()); // Thread-safe: emit signal instead of direct UI access
         return;
       }
     }
     catch (cv_bridge::Exception& e)
     {
       qWarning("ImageView.callback_image() while trying to convert image from '%s' to 'rgb8' an exception was thrown (%s)", msg->encoding.c_str(), e.what());
-      ui_.image_frame->setImage(QImage());
+      emit newImageAvailable(QImage()); // Thread-safe: emit signal instead of direct UI access
       return;
     }
   }
@@ -693,19 +742,22 @@ void ImageView::callbackImage(const sensor_msgs::Image::ConstPtr& msg)
   main_image_timestamp_ = msg->header.stamp;
   last_main_update_time_ = ros::Time::now();
 
+  ROS_INFO_THROTTLE(1.0, "rqt_image_view: Main image callback - timestamp: %.3f (zero: %d), update time: %.3f",
+                    main_image_timestamp_.toSec(), main_image_timestamp_.isZero(), last_main_update_time_.toSec());
+
   // Generate composite image with HUD overlay
   generateCompositeImage();
 }
 
 std::string ImageView::parseBaseTopicName(const std::string& topic, const std::string& transport)
 {
-  // Strip transport suffix (e.g., "/compressed", "/theora") from the topic name
-  // Example: "/camera/image_raw" + "compressed" -> "/camera/image_raw"
-  // We need to handle cases where the transport is appended as a suffix
+  // Strip transport suffix and /image_* suffix to get camera base name
+  // Example: "/fpv_camera/image_compressed" -> "/fpv_camera"
+  // Example: "/camera/image_raw" -> "/camera"
 
   std::string base_topic = topic;
 
-  // Check if the topic ends with the transport name
+  // First, strip transport suffix if present (e.g., "/compressed", "/theora")
   if (!transport.empty() && transport != "raw")
   {
     std::string transport_suffix = "/" + transport;
@@ -713,6 +765,20 @@ std::string ImageView::parseBaseTopicName(const std::string& topic, const std::s
     if (pos != std::string::npos && pos == base_topic.length() - transport_suffix.length())
     {
       base_topic = base_topic.substr(0, pos);
+    }
+  }
+
+  // Now strip the /image_* suffix to get the camera base name
+  // Find the last occurrence of "/image"
+  size_t image_pos = base_topic.rfind("/image");
+  if (image_pos != std::string::npos)
+  {
+    // Check if what follows "/image" is either nothing or starts with underscore or is a known suffix
+    // This handles cases like /image_raw, /image_compressed, /image_rect, etc.
+    std::string after_image = base_topic.substr(image_pos + 6); // 6 = length of "/image"
+    if (after_image.empty() || after_image[0] == '_' || after_image[0] == '/')
+    {
+      base_topic = base_topic.substr(0, image_pos);
     }
   }
 
@@ -756,8 +822,8 @@ cv::Mat ImageView::processStaleHud(const cv::Mat& hud, double age_sec)
   {
     // Convert to grayscale
     cv::Mat gray;
-    cv::cvtColor(processed_hud, gray, cv::COLOR_BGR2GRAY);
-    cv::cvtColor(gray, processed_hud, cv::COLOR_GRAY2BGR);
+    cv::cvtColor(processed_hud, gray, cv::COLOR_RGB2GRAY);
+    cv::cvtColor(gray, processed_hud, cv::COLOR_GRAY2RGB);
 
     // Apply 50% transparency effect (will be used during blending)
     processed_hud = processed_hud * 0.5;
@@ -775,9 +841,9 @@ cv::Mat ImageView::processStaleHud(const cv::Mat& hud, double age_sec)
     cv::Point text_pos(processed_hud.cols - text_size.width - 10,
                        processed_hud.rows - 10);
 
-    // Draw text in red (BGR: 0, 0, 255)
+    // Draw text in red (RGB: 255, 0, 0)
     cv::putText(processed_hud, text, text_pos, font_face, font_scale,
-                cv::Scalar(0, 0, 255), thickness);
+                cv::Scalar(255, 0, 0), thickness);
   }
 
   return processed_hud;
@@ -816,8 +882,12 @@ void ImageView::overlayHud(cv::Mat& main, const cv::Mat& hud)
 
 void ImageView::generateCompositeImage()
 {
+  // Lock recursive_mutex to protect shared image data and timestamps
+  // Note: This lock is recursive-safe since callbacks already hold it
+  std::lock_guard<std::recursive_mutex> lock(image_mutex_);
+
   cv::Mat composite;
-  ros::Time now = ros::Time::now();
+  bool hud_filtered_out = false;
 
   // Handle case where we have HUD but no main image
   if (conversion_mat_.empty())
@@ -825,25 +895,19 @@ void ImageView::generateCompositeImage()
     // If we have HUD data, create a black background to display it on
     if (!hud_conversion_mat_.empty() && !hud_image_timestamp_.isZero())
     {
-      double hud_age = (now - hud_image_timestamp_).toSec();
-      cv::Mat processed_hud = processStaleHud(hud_conversion_mat_, hud_age);
+      // When no main image, can't calculate relative age, so just display HUD
+      cv::Mat processed_hud = hud_conversion_mat_.clone();
 
-      if (!processed_hud.empty())
-      {
-        // Create black background matching HUD size
-        composite = cv::Mat::zeros(hud_conversion_mat_.rows, hud_conversion_mat_.cols, CV_8UC3);
-        overlayHud(composite, processed_hud);
+      // Create black background matching HUD size
+      composite = cv::Mat::zeros(hud_conversion_mat_.rows, hud_conversion_mat_.cols, CV_8UC3);
+      overlayHud(composite, processed_hud);
 
-        // Display the HUD-only image
-        QImage image(composite.data, composite.cols, composite.rows, composite.step[0], QImage::Format_RGB888);
-        ui_.image_frame->setImage(image);
+      // Create QImage with DEEP COPY (not shallow wrapper of composite.data)
+      QImage image(composite.data, composite.cols, composite.rows, composite.step[0], QImage::Format_RGB888);
+      QImage imageCopy = image.copy(); // Deep copy to avoid dangling pointer when composite goes out of scope
 
-        if (!ui_.zoom_1_push_button->isEnabled())
-        {
-          ui_.zoom_1_push_button->setEnabled(true);
-        }
-        onZoom1(ui_.zoom_1_push_button->isChecked());
-      }
+      // Emit signal to update UI on main thread (thread-safe)
+      emit newImageAvailable(imageCopy);
     }
     return; // Nothing to display
   }
@@ -851,49 +915,118 @@ void ImageView::generateCompositeImage()
   // Start with a copy of the processed main image
   composite = conversion_mat_.clone();
 
-  // Calculate main image age and apply dimming
+  // Calculate main image age relative to current time (for dimming based on data staleness)
   double main_age = 0.0;
-
   if (!main_image_timestamp_.isZero())
   {
-    main_age = (now - main_image_timestamp_).toSec();
+    main_age = (ros::Time::now() - main_image_timestamp_).toSec();
     applyDimmingOverlay(composite, main_age);
   }
 
   // Process and overlay HUD if available
-  if (!hud_conversion_mat_.empty() && !hud_image_timestamp_.isZero())
+  if (!hud_conversion_mat_.empty())
   {
-    double hud_age = (now - hud_image_timestamp_).toSec();
+    // Calculate HUD age:
+    // - If message timestamps are valid (non-zero), use message timestamp difference (works with bag playback)
+    // - If timestamps are zero, use wall clock time difference (live topics without timestamps)
+    double hud_age = 0.0;
+
+    if (!main_image_timestamp_.isZero() && !hud_image_timestamp_.isZero())
+    {
+      // Both timestamps valid - use message time difference
+      hud_age = std::abs((main_image_timestamp_ - hud_image_timestamp_).toSec());
+      ROS_INFO_THROTTLE(1.0, "rqt_image_view: Composite generation - HUD available, age (from timestamps): %.3f sec", hud_age);
+    }
+    else
+    {
+      // Timestamps not available - fall back to wall clock time
+      hud_age = (ros::Time::now() - last_hud_update_time_).toSec();
+      ROS_INFO_THROTTLE(1.0, "rqt_image_view: Composite generation - HUD available, age (from wall clock): %.3f sec", hud_age);
+    }
+
     cv::Mat processed_hud = processStaleHud(hud_conversion_mat_, hud_age);
 
     if (!processed_hud.empty())
     {
+      ROS_INFO_THROTTLE(1.0, "rqt_image_view: Overlaying HUD onto main image");
       overlayHud(composite, processed_hud);
     }
+    else
+    {
+      ROS_INFO_THROTTLE(1.0, "rqt_image_view: HUD too old (%.3f sec), not displaying", hud_age);
+      hud_filtered_out = true;
+    }
   }
-
-  // Update the display with composite image
-  QImage image(composite.data, composite.cols, composite.rows, composite.step[0], QImage::Format_RGB888);
-  ui_.image_frame->setImage(image);
-
-  if (!ui_.zoom_1_push_button->isEnabled())
+  else
   {
-    ui_.zoom_1_push_button->setEnabled(true);
+    ROS_INFO_THROTTLE(1.0, "rqt_image_view: No HUD data available");
   }
-  onZoom1(ui_.zoom_1_push_button->isChecked());
+
+  // Draw "HUD info obsolete" message with timestamp when HUD is filtered out
+  if (hud_filtered_out)
+  {
+    // Calculate how old the HUD is
+    double hud_age = 0.0;
+    if (!main_image_timestamp_.isZero() && !hud_image_timestamp_.isZero())
+    {
+      hud_age = std::abs((main_image_timestamp_ - hud_image_timestamp_).toSec());
+    }
+    else
+    {
+      hud_age = (ros::Time::now() - last_hud_update_time_).toSec();
+    }
+
+    // Format the message with age information
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "HUD info obsolete (%.1fs old, hidden)", hud_age);
+    std::string text(buffer);
+
+    // Add timestamp of last HUD update
+    char time_buffer[128];
+    time_t hud_time = hud_image_timestamp_.isZero() ? last_hud_update_time_.sec : hud_image_timestamp_.sec;
+    struct tm* timeinfo = localtime(&hud_time);
+    strftime(time_buffer, sizeof(time_buffer), "Last HUD: %H:%M:%S", timeinfo);
+    std::string timestamp_text(time_buffer);
+
+    int font_face = cv::FONT_HERSHEY_SIMPLEX;
+    double font_scale = 0.7;
+    int thickness = 2;
+    cv::Scalar text_color(255, 255, 255); // White
+
+    // Draw main message at top left
+    cv::Point text_pos(10, 30);
+    cv::putText(composite, text, text_pos, font_face, font_scale, text_color, thickness, cv::LINE_AA);
+
+    // Draw timestamp below main message
+    cv::Point time_pos(10, 60);
+    cv::putText(composite, timestamp_text, time_pos, font_face, font_scale * 0.8, text_color, thickness - 1, cv::LINE_AA);
+  }
+
+  // Create QImage with DEEP COPY (not shallow wrapper of composite.data)
+  QImage image(composite.data, composite.cols, composite.rows, composite.step[0], QImage::Format_RGB888);
+  QImage imageCopy = image.copy(); // Deep copy to avoid dangling pointer when composite goes out of scope
+
+  // Emit signal to update UI on main thread (thread-safe)
+  emit newImageAvailable(imageCopy);
 }
 
 void ImageView::callbackImageHud(const sensor_msgs::Image::ConstPtr& msg)
 {
+  // Lock recursive_mutex to protect shared HUD data and timestamps from concurrent access
+  std::lock_guard<std::recursive_mutex> lock(image_mutex_);
+
   try
   {
-    // Convert ROS image to OpenCV format
-    cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+    // Convert ROS image to OpenCV format (RGB8 to match main image format)
+    cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::RGB8);
 
     // Store HUD image and timestamp
     hud_conversion_mat_ = cv_ptr->image.clone();
     hud_image_timestamp_ = msg->header.stamp;
     last_hud_update_time_ = ros::Time::now();
+
+    ROS_INFO_THROTTLE(1.0, "rqt_image_view: HUD callback received image %dx%d, timestamp %.3f",
+                      hud_conversion_mat_.cols, hud_conversion_mat_.rows, msg->header.stamp.toSec());
 
     // Trigger redraw if:
     // 1. No main image has been received yet (display HUD on black background), OR
@@ -901,14 +1034,19 @@ void ImageView::callbackImageHud(const sensor_msgs::Image::ConstPtr& msg)
     if (last_main_update_time_.isZero())
     {
       // No main image yet - display HUD alone
+      // NOTE: This should only happen briefly when first selecting a topic before main callback runs
+      ROS_WARN("rqt_image_view: No main image callback yet (last_main_update_time is zero), displaying HUD alone");
       generateCompositeImage();
     }
     else
     {
-      // Main image exists - only trigger if it hasn't updated recently
+      // Main image exists - trigger if it hasn't updated recently (use wall clock for trigger timing)
       double time_since_main = (ros::Time::now() - last_main_update_time_).toSec();
+      ROS_DEBUG_THROTTLE(1.0, "rqt_image_view: HUD received, time since main update: %.3f sec (trigger delay: %.3f)",
+                         time_since_main, hud_trigger_delay_);
       if (time_since_main > hud_trigger_delay_)
       {
+        ROS_DEBUG("rqt_image_view: Triggering composite generation from HUD callback (main image hasn't updated recently)");
         generateCompositeImage();
       }
     }

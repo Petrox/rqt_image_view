@@ -159,7 +159,7 @@
            <string>Dynamic depth range</string>
           </property>
           <property name="text">
-           <string>Smooth scaling</string>
+           <string>Smooth_scaling</string>
           </property>
          </widget>
         </item>

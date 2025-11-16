@@ -54,6 +54,8 @@
 #include <QWidget>
 
 #include <vector>
+#include <mutex>
+#include <atomic>
 
 namespace rqt_image_view {
 
@@ -90,13 +92,25 @@ protected:
 
   virtual void selectTopic(const QString& topic);
 
+signals:
+
+  // Thread-safe signal to update image from ROS callbacks
+  void newImageAvailable(const QImage& image);
+
 protected slots:
+
+  // Thread-safe slot to update UI (runs on Qt main thread)
+  void updateImageDisplay(const QImage& image);
 
   virtual void onTopicChanged(int index);
 
   virtual void onZoom1(bool checked);
 
   virtual void onDynamicRange(bool checked);
+
+  virtual void onMaxRangeChanged(double value);
+
+  virtual void onColorSchemeChanged(int index);
 
   virtual void saveImage();
 
@@ -183,6 +197,17 @@ private:
   double hud_disappear_threshold_;
   double main_dim_start_;
   double main_dim_end_;
+
+  // Cached UI widget values for thread-safe access from ROS callbacks
+  // These are updated from Qt slots (main thread) and read from callbacks (ROS threads)
+  std::atomic<double> max_range_;
+  std::atomic<bool> dynamic_range_enabled_;
+  std::atomic<int> color_scheme_;
+
+  // Thread safety: recursive_mutex protects all shared image data and timestamps
+  // accessed from ROS callbacks (callbackImage, callbackImageHud) and generateCompositeImage
+  // Recursive to allow callbacks to call generateCompositeImage() while holding lock
+  mutable std::recursive_mutex image_mutex_;
 };
 
 }

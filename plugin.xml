@@ -5,11 +5,11 @@
     </description>
     <qtgui>
       <group>
-        <label>Visualization</label>
+        <label>RCVD</label>
         <icon type="theme">folder</icon>
         <statustip>Plugins related to visualization.</statustip>
       </group>
-      <label>Image View</label>
+      <label>Gen2 Image View</label>
       <icon type="theme">image-x-generic</icon>
       <statustip>A GUI plugin for viewing sensor_msgs/Image topics.</statustip>
     </qtgui>

@@ -68,6 +68,14 @@ endif()
 find_package(class_loader)
 class_loader_hide_library_symbols(${PROJECT_NAME})
 
+# Copy plugin.xml to devel space for plugin discovery
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin.xml
+    ${CATKIN_DEVEL_PREFIX}/share/${PROJECT_NAME}/plugin.xml
+  COMMENT "Copying plugin.xml to devel space"
+)
+
 install(FILES plugin.xml
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
